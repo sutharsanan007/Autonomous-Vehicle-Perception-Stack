@@ -9,3 +9,6 @@ __pycache__/
 # Ignore system files
 .DS_Store
 Thumbs.db
+
+# Ignore PyTorch AI Model Weights
+*.pt

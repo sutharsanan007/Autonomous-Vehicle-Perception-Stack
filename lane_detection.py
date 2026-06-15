@@ -6,7 +6,7 @@ import torchvision.transforms as transforms
 # 1. Load the pre-trained YOLOP model from PyTorch Hub
 print("Loading YOLOP AI for Semantic Road Segmentation...")
 yolop_model = torch.hub.load('hustvl/yolop', 'yolop', pretrained=True)
-yolop_model.eval() # Set model to evaluation (inference) mode
+yolop_model.eval()  # Set model to evaluation (inference) mode
 
 # 2. Standard image normalization required by YOLOP
 transform = transforms.Compose([
@@ -24,27 +24,25 @@ def process_lanes(frame):
 
     # Run AI Inference
     with torch.no_grad():
-        # YOLOP outputs 3 things: Object boxes, Drivable Area mask, and Lane Line mask
+        # YOLOP outputs: Object boxes, Drivable Area mask, and Lane Line mask
         _, da_seg_out, ll_seg_out = yolop_model(img_tensor)
 
-    # Extract Drivable Area (Green Carpet)
-    da_predict = da_seg_out[:, 1, :, :] > da_seg_out[:, 0, :, :]
-    da_mask = da_predict.squeeze().cpu().numpy().astype(np.uint8)
+    # FIX: Use argmax across the channel dimension (dim=1) to collapse 
+    # the probability channels down to a flat 2D image [640, 640]
+    da_mask = torch.argmax(da_seg_out, dim=1).squeeze().cpu().numpy().astype(np.uint8)
+    ll_mask = torch.argmax(ll_seg_out, dim=1).squeeze().cpu().numpy().astype(np.uint8)
 
-    # Extract Lane Lines (Red Lines)
-    ll_mask = torch.round(ll_seg_out).squeeze().cpu().numpy().astype(np.uint8)
-
-    # Resize masks back to your video's original HD resolution
+    # Resize the flat 2D masks back to your video's original resolution
     da_mask_resized = cv2.resize(da_mask, (w_orig, h_orig), interpolation=cv2.INTER_NEAREST)
     ll_mask_resized = cv2.resize(ll_mask, (w_orig, h_orig), interpolation=cv2.INTER_NEAREST)
 
-    # Create the blank overlay and paint it
+    # Create the blank overlay and paint the pixel classes
     overlay = np.zeros_like(frame)
-    overlay[da_mask_resized == 1] = (0, 255, 0)   # Paint road green
-    overlay[ll_mask_resized == 1] = (0, 0, 255)   # Paint lanes red
+    overlay[da_mask_resized == 1] = (0, 255, 0)   # Paint drivable road green
+    overlay[ll_mask_resized == 1] = (0, 0, 255)   # Paint lane lines red
 
     # --- ADAS DASHBOARD LOGIC ---
-    # We mathematically check the bottom row of red lane pixels to find the car's deviation
+    # Look at the bottom section of the lane mask to compute cross-track deviation
     bottom_red_pixels = np.where(ll_mask_resized[h_orig-50:h_orig, :] == 1)[1]
     deviation = 0.0
     is_warning = False

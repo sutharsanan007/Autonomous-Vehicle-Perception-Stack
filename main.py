@@ -1,17 +1,5 @@
 # ─────────────────────────────────────────────────────────────────────────────
 #  main.py  |  Modular Hybrid ADAS — Orchestrator
-#
-#  CHANGE IN THIS VERSION
-#    The video source was hardcoded to "data/test_video.mp4", which is the
-#    opposite of "100% autonomous, works on any video or webcam."
-#    It now accepts a command-line argument:
-#      python main.py                  → defaults to data/test_video.mp4
-#      python main.py path/to/clip.mp4 → any video file
-#      python main.py 0                → webcam index 0 (built-in camera)
-#      python main.py 1                → webcam index 1 (external camera)
-#    No other logic changed — lane_detection.py's autonomy (no hardcoded
-#    pixel coordinates, fully dynamic horizons) means it adapts to whatever
-#    resolution/source main.py hands it.
 # ─────────────────────────────────────────────────────────────────────────────
 
 import sys
@@ -22,24 +10,28 @@ from lane_detection import process_lanes, WARNING_THRESH
 
 
 def resolve_source(arg: str):
-    """
-    Turn a CLI argument into something cv2.VideoCapture understands.
-    A pure integer string ("0", "1", ...) is treated as a webcam index;
-    anything else is treated as a file path.
-    """
     return int(arg) if arg.isdigit() else arg
 
 
-def draw_hud(image, stats: dict, fps: float):
-    """
-    Draws the transparent ADAS dashboard on the final frame.
-
-    Two panels, matching the reference-image layout:
-      • Top-left  — system telemetry (FPS, deviation, visibility, mode).
-      • Top-right — lane-keeping status + "Upcoming Road" curve classifier
-        (NEW — sourced from lane_detection's _classify_curvature output).
-    """
+def draw_hud(image, stats: dict, fps: float, fcw_warning: bool):
     h, w = image.shape[:2]
+
+    # ── Emergency Collision Override ──
+    if fcw_warning:
+        # Create a transparent red emergency flash over the whole screen
+        red_tint = image.copy()
+        red_tint[:] = (0, 0, 200)  # BGR Red
+        image = cv2.addWeighted(red_tint, 0.35, image, 0.65, 0)
+        
+        # Draw massive BRAKE warning in the center
+        warn_text = "!!! BRAKE - COLLISION WARNING !!!"
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale, thick = 1.2, 4
+        (tw, th), _ = cv2.getTextSize(warn_text, font, scale, thick)
+        tx = (w - tw) // 2
+        ty = (h // 2) - 50
+        cv2.putText(image, warn_text, (tx, ty), font, scale, (255, 255, 255), thick + 2)
+        cv2.putText(image, warn_text, (tx, ty), font, scale, (0, 0, 255), thick)
 
     # ── Top-left telemetry panel ──────────────────────────────────────────────
     overlay = image.copy()
@@ -69,7 +61,7 @@ def draw_hud(image, stats: dict, fps: float):
     cv2.putText(image, f"Visibility: {brightness}",(20, 145), font, 0.6, vis_color,        2)
     cv2.putText(image, f"Mode: {stats['road_status']}", (20, 180), font, 0.6, (255,255,255), 2)
 
-    # ── Top-right status panel (reference-image style) ───────────────────────
+    # ── Top-right status panel ───────────────────────
     panel_w   = 440
     panel_x0  = w - panel_w - 10
     overlay2  = image.copy()
@@ -79,12 +71,9 @@ def draw_hud(image, stats: dict, fps: float):
     warn_color = (0, 0, 255) if is_warning else (0, 255, 0)
     warn_text  = "WARNING! LANE DEPARTURE" if is_warning else "Good Lane Keeping"
 
-    cv2.putText(image, "[Lane Keeping Status]", (panel_x0 + 15, 35),
-                font, 0.6, (255, 255, 255), 2)
-    cv2.putText(image, warn_text, (panel_x0 + 15, 75),
-                font, 0.8, warn_color, 2)
-    cv2.putText(image, f"[Upcoming Road]: {stats['upcoming_road']}",
-                (panel_x0 + 15, 110), font, 0.55, (255, 255, 255), 2)
+    cv2.putText(image, "[Lane Keeping Status]", (panel_x0 + 15, 35), font, 0.6, (255, 255, 255), 2)
+    cv2.putText(image, warn_text, (panel_x0 + 15, 75), font, 0.8, warn_color, 2)
+    cv2.putText(image, f"[Upcoming Road]: {stats['upcoming_road']}", (panel_x0 + 15, 110), font, 0.55, (255, 255, 255), 2)
 
     return image
 
@@ -92,8 +81,7 @@ def draw_hud(image, stats: dict, fps: float):
 def main():
     model = initialize_model()
 
-    # Default to the bundled test clip if no source is given on the CLI
-    arg        = sys.argv[1] if len(sys.argv) > 1 else "data/test_video.mp4"
+    arg        = sys.argv[1] if len(sys.argv) > 1 else "data/test_video_2.mp4"
     source     = resolve_source(arg)
     cap        = cv2.VideoCapture(source)
     prev_time  = 0
@@ -115,9 +103,14 @@ def main():
 
         # ── Pipeline ──────────────────────────────────────────────────────────
         lane_overlay, lane_stats = process_lanes(frame)
-        frame_with_objects       = detect_obstacles(frame, model)
-        blended_frame            = cv2.addWeighted(frame_with_objects, 1.0, lane_overlay, 0.55, 0)
-        final_output             = draw_hud(blended_frame, lane_stats, fps)
+        
+        # ── NEW: Capture the new fcw_warning flag ──
+        frame_with_objects, fcw_warning = detect_obstacles(frame, model)
+        
+        blended_frame = cv2.addWeighted(frame_with_objects, 1.0, lane_overlay, 0.55, 0)
+        
+        # ── NEW: Pass fcw_warning to the HUD ──
+        final_output = draw_hud(blended_frame, lane_stats, fps, fcw_warning)
 
         cv2.imshow("Modular Hybrid ADAS Prototype", final_output)
         if cv2.waitKey(1) & 0xFF == ord('q'):

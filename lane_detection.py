@@ -1,34 +1,5 @@
 # ─────────────────────────────────────────────────────────────────────────────
-#  lane_detection.py  |  Modular Hybrid ADAS — Lane Perception Module  (v6)
-#
-#  REVERTED FROM v5's bird's-eye warp back to direct camera-space fitting.
-#
-#  WHY THE BIRD'S-EYE WARP (v5) WAS WRONG FOR THIS PROJECT:
-#    The reference video (Handong University Mechatronics Capstone — Jang,
-#    Park, Yun) was analyzed frame-by-frame.  Its green border lines:
-#      • Never visually meet at a single point near the horizon.
-#      • Stay glued to the real lane markings through curves, including
-#        a sharp "Warning! OFF Lane" right-curve frame.
-#      • Stop independently at different heights for left vs right line —
-#        NOT a shared, calculated convergence point.
-#    This is the signature of DIRECT CAMERA-SPACE fitting with a SHORTENED
-#    draw distance — not a bird's-eye warp.  The warp/unwarp round-trip
-#    (verified mathematically correct in isolation) is nonetheless
-#    extremely sensitive to small per-frame coefficient noise once
-#    unwarped back near the vanishing point — exactly the wild hook seen
-#    in the screenshot.  The reference avoids this failure mode entirely
-#    by simply never drawing that close to the horizon.
-#
-#  THIS VERSION:
-#    • Restores v4's direct camera-space polynomial engine (guided sliding
-#      window keyed to prev_fit per band — stable, no drift, no warp).
-#    • Each line's draw distance is now INDEPENDENT (left and right can
-#      stop at different heights), driven by where that line's own pixel
-#      detections actually run out — exactly matching the reference's
-#      visual behaviour (see frame analysis above).
-#    • Keeps the v5 visual style you approved: two independent thick
-#      green border lines, semi-transparent blue carpet, steering arrow
-#      + percentage, "Upcoming Road" text classifier.
+#  lane_detection.py  |  Modular Hybrid ADAS — Lane Perception Module  (v6.9)
 # ─────────────────────────────────────────────────────────────────────────────
 
 import warnings
@@ -37,14 +8,12 @@ import cv2
 import numpy as np
 import torchvision.transforms as transforms
 
-# ── NumPy RankWarning — version-safe suppression ──────────────────────────────
 try:
-    from numpy.exceptions import RankWarning as _RankWarning   # NumPy ≥ 2.0
+    from numpy.exceptions import RankWarning as _RankWarning
 except ImportError:
-    _RankWarning = np.RankWarning                               # NumPy < 2.0
+    _RankWarning = np.RankWarning
 warnings.filterwarnings('ignore', category=_RankWarning)
 
-# ── Model Initialization ──────────────────────────────────────────────────────
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Initializing YOLOP AI on hardware: {device.type.upper()}...")
 
@@ -57,74 +26,65 @@ transform = transforms.Compose([
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
 
-# ── Tunable Constants ─────────────────────────────────────────────────────────
-SEARCH_HORIZON_RATIO = 0.57    # top of the pixel-search ROI (fraction of h)
-SMOOTH_ALPHA         = 0.75    # EMA weight for previous-frame polynomial
-N_CURVE_PTS          = 60      # points sampled along each drawn curve
-LINE_THICKNESS       = 10      # thick independent border lines (reference style)
-DILATE_KERN          = 9       # fills dashed-line gaps before window search
-WARNING_THRESH       = 6.0    # deviation % that triggers lane-departure alert
+SEARCH_HORIZON_RATIO = 0.57
+SMOOTH_ALPHA         = 0.75
+N_CURVE_PTS          = 60
+LINE_THICKNESS       = 10
+DILATE_KERN          = 9
+WARNING_THRESH       = 6.0
 
-# Sliding window
-N_WINDOWS            = 15      # horizontal scan bands (bottom → search horizon)
-WINDOW_MARGIN        = 90      # half-width of each band's search window (px)
-MIN_PIX_RECENTER     = 8       # min pixels in a band to accept a new centre
+N_WINDOWS            = 15
+WINDOW_MARGIN        = 90
+MIN_PIX_RECENTER     = 8
 
-# Polynomial fitting
-MIN_PIXELS           = 25      # min pixels required for np.polyfit
-MIN_Y_SPAN           = 60      # min vertical spread — RankWarning gate
-MIN_LANE_RATIO       = 0.12    # anti-crossing safety net (fraction of w)
-MAX_CURVATURE        = 0.0018
+MIN_PIXELS           = 25
+MIN_Y_SPAN           = 60
+MIN_LANE_RATIO       = 0.12
 
-# Cold-start histogram (first frame only)
-INNER_LANE_RATIO     = 0.38    # search only inner 38% of each half
-HIST_SIGMA_RATIO     = 0.08    # exponential-bias sigma (fraction of w)
+INNER_LANE_RATIO     = 0.38
+HIST_SIGMA_RATIO     = 0.08
 
-# Independent draw-distance shortening
-MIN_CONFIDENT_BANDS  = 4        # require at least this many live bands found
-DRAW_MARGIN_BANDS    = 1        # stop 1 band short of the last confident hit
+MIN_CONFIDENT_BANDS  = 4
+DRAW_MARGIN_BANDS    = 1
 
-# Hold-recovery
-MAX_HOLD_FRAMES      = 8        # after this many consecutive holds, force cold-start
-WINDOW_WIDEN_STEP    = 25       # px to widen the search margin per consecutive hold
-WINDOW_WIDEN_CAP     = 200      # never widen past this 
-
-# Curvature → steering guidance thresholds
-CURVE_DEAD_ZONE      = 0.00035  # |a| below this = "Stay Straight"     
+MAX_HOLD_FRAMES      = 8
+WINDOW_WIDEN_STEP    = 25
+WINDOW_WIDEN_CAP     = 200
 
 YELLOW       = (0, 255, 255)
-GREEN        = (60, 220, 60)        # border line colour when centred
-BLUE_FILL    = (235, 140, 60)       # BGR — semi-transparent blue carpet
-RED_FILL     = (50, 50, 230)        # BGR — carpet turns red on warning
-RED_BORDER   = (60, 60, 230)        # BGR — border lines turn red
+GREEN        = (60, 220, 60)
+BLUE_FILL    = (235, 140, 60)
+RED_FILL     = (50, 50, 230)
+RED_BORDER   = (60, 60, 230)
 WHITE        = (255, 255, 255)
 
-# Deviation-correction arrow threshold
 CORRECTION_DEAD_ZONE = 3.0
 
 DEBUG_MASK = False
 DEBUG_PRINT = True
 _frame_counter = 0
 
-# ── Persistent State ──────────────────────────────────────────────────────────
-_prev_left_fit   = None         
-_prev_right_fit  = None
+_prev_left_fit    = None         
+_prev_right_fit   = None
 _left_hold_count  = 0           
 _right_hold_count = 0
 _last_warn_state  = False           
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  PRIVATE HELPERS — Perception
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _infer_mask(frame, h, w):
+def _infer_mask(frame, h, w, vehicle_boxes=None):
     img    = cv2.resize(frame, (640, 640))
     tensor = transform(img).unsqueeze(0).to(device)
     with torch.no_grad():
         _, _, seg = yolop_model(tensor)
     raw  = torch.argmax(seg, dim=1).squeeze().cpu().numpy().astype(np.uint8)
     mask = cv2.resize(raw, (w, h), interpolation=cv2.INTER_NEAREST)
+    
+    if vehicle_boxes:
+        for (x1, y1, x2, y2) in vehicle_boxes:
+            bx1, by1 = max(0, int(x1) - 20), max(0, int(y1) - 20)
+            bx2, by2 = min(w, int(x2) + 20), min(h, int(y2) + 20)
+            cv2.rectangle(mask, (bx1, by1), (bx2, by2), 0, -1)
+            
     return cv2.dilate(mask, np.ones((DILATE_KERN, DILATE_KERN), np.uint8))
 
 
@@ -285,18 +245,42 @@ def _lanes_crossing(left_fit, right_fit, h, w, horizon_y):
     return bool(actual_crossing or too_narrow)
 
 
-def _classify_curvature(left_fit, right_fit):
-    avg_a = (left_fit[0] + right_fit[0]) / 2.0
+# ── PERFECTED: Inverse Visibility Curve Scaling ──
+def _classify_curvature(left_fit, right_fit, h, top_y):
+    y_bot = float(h - 1)
+    y_top = float(max(top_y, 0))
+    carpet_height = y_bot - y_top
     
-    # PERFECTED MATH: Map to true 0-100% "Sharpness" scale
-    raw_pct = (abs(avg_a) / MAX_CURVATURE) * 100.0
-    pct = int(round(np.clip(raw_pct, 0, 100)))
-
-    if abs(avg_a) < CURVE_DEAD_ZONE:
+    # 1. HARD CUTOFF: If view is utterly blocked, do not guess.
+    if carpet_height < (h * 0.20):
         return 'straight', 0
         
-    # RESTORED MATH: Positive 'a' mathematically means a right-hand curve
-    return ('right', pct) if avg_a > 0 else ('left', pct)
+    y_mid = (y_bot + y_top) / 2.0
+    
+    cx_bot = (_eval(left_fit, y_bot) + _eval(right_fit, y_bot)) / 2.0
+    cx_top = (_eval(left_fit, y_top) + _eval(right_fit, y_top)) / 2.0
+    cx_mid = (_eval(left_fit, y_mid) + _eval(right_fit, y_mid)) / 2.0
+    
+    straight_mid_x = (cx_bot + cx_top) / 2.0
+    bulge = cx_mid - straight_mid_x
+    
+    # 2. VISIBILITY SCALING
+    # visibility_ratio ranges from ~0.2 (terrible view) to ~0.7 (perfect view)
+    visibility_ratio = carpet_height / h 
+    
+    # When visibility is excellent, dead zone shrinks to 3.0 pixels (highly sensitive)
+    # When visibility is terrible, dead zone swells to 12.0+ pixels (ignores fake wiggles)
+    dynamic_dead_zone = 3.0 + (1.0 - visibility_ratio) * 12.0 
+    
+    if abs(bulge) < dynamic_dead_zone:
+        return 'straight', 0
+
+    # 3. DYNAMIC PERCENTAGE MAPPING
+    # A 15px bulge on a short line is a sharper curve than a 15px bulge on a long line.
+    expected_max_bulge = 45.0 * visibility_ratio 
+    pct = int(round(np.clip((abs(bulge) / expected_max_bulge) * 100.0, 0, 100)))
+        
+    return ('left', pct) if bulge > 0 else ('right', pct)
 
 
 def _arrow_polygon(cx, cy, direction, size):
@@ -307,14 +291,12 @@ def _arrow_polygon(cx, cy, direction, size):
             [cx + 22, cy - size + 30],
         ], dtype=np.int32)
     elif direction == 'right':
-        # FIXED: Arrow tip physically points RIGHT (cx + size)
         return np.array([
             [cx + size, cy], [cx + size - 30, cy - 22], [cx + size - 30, cy - 10],
             [cx - size, cy - 10], [cx - size, cy + 10], [cx + size - 30, cy + 10],
             [cx + size - 30, cy + 22],
         ], dtype=np.int32)
-    else:  # left
-        # FIXED: Arrow tip physically points LEFT (cx - size)
+    else:  
         return np.array([
             [cx - size, cy], [cx - size + 30, cy - 22], [cx - size + 30, cy - 10],
             [cx + size, cy - 10], [cx + size, cy + 10], [cx - size + 30, cy + 10],
@@ -332,20 +314,14 @@ def _draw_curve_arrow(overlay, direction, pct, w, h):
 
 
 def _draw_correction_arrow(overlay, direction, dev_pct, w, h):
-    """
-    SAFETY signal — shows which way to steer to get back to centre.
-    """
-    # ── FIXED PLACEMENT ──
-    # Pushed outward (0.22) and upward (0.82) to avoid the wide green carpet
     offset_x = int(w * 0.22)
     cx = (w // 2) - offset_x if direction == 'left' else (w // 2) + offset_x
     cy = int(h * 0.82)
     
     pts = _arrow_polygon(cx, cy, direction, size=30)
-    color = (60, 60, 230)   # red — matches the warning fill/border
+    color = (60, 60, 230)
     cv2.polylines(overlay, [pts], isClosed=True, color=color, thickness=3)
     
-    # Text dynamically centered ABOVE the arrow so it doesn't clip off screen
     text = f"{dev_pct:.0f}%"
     font = cv2.FONT_HERSHEY_SIMPLEX
     scale, thick = 0.7, 2
@@ -356,11 +332,7 @@ def _draw_correction_arrow(overlay, direction, dev_pct, w, h):
     cv2.putText(overlay, text, (tx, ty), font, scale, color, thick)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  PUBLIC API — called by main.py
-# ─────────────────────────────────────────────────────────────────────────────
-
-def process_lanes(frame):
+def process_lanes(frame, vehicle_boxes=None):
     global _prev_left_fit, _prev_right_fit, _left_hold_count, _right_hold_count, _frame_counter, _last_warn_state
 
     h, w             = frame.shape[:2]
@@ -371,7 +343,7 @@ def process_lanes(frame):
     _blank = dict(deviation=0.0, is_warning=False, road_status="Searching...",
                   brightness=bright, upcoming_road="—")
 
-    mask = _infer_mask(frame, h, w)
+    mask = _infer_mask(frame, h, w, vehicle_boxes)
 
     force_left_reset  = _left_hold_count  >= MAX_HOLD_FRAMES
     force_right_reset = _right_hold_count >= MAX_HOLD_FRAMES
@@ -437,8 +409,6 @@ def process_lanes(frame):
 
     if DEBUG_PRINT:
         _frame_counter += 1
-        
-        # Build anomalies list dynamically using existing v6 variables
         anomalies = []
         if force_left_reset: anomalies.append("L_FORCE_RESET")
         if force_right_reset: anomalies.append("R_FORCE_RESET")
@@ -448,33 +418,18 @@ def process_lanes(frame):
         has_anomaly = len(anomalies) > 0
         warn_changed = (is_warn != _last_warn_state)
 
-        # Throttle: Only print on an anomaly, a warning toggle, or a 30-frame heartbeat
         if has_anomaly or warn_changed or _frame_counter % 30 == 0:
             dev_dir = "R" if dev_pct > 0 else "L"
-            
-            if is_warn:
-                tag = "🚨 DEPARTURE"
-            elif has_anomaly:
-                tag = "⚠️ ANOMALY  "
-            else:
-                tag = "🟢 STABLE   "
-
-            # Clean, human-readable summary
+            if is_warn: tag = "🚨 DEPARTURE"
+            elif has_anomaly: tag = "⚠️ ANOMALY  "
+            else: tag = "🟢 STABLE   "
             print(f"[{_frame_counter:05d}] {tag} | Dev: {abs(dev_pct):4.1f}% {dev_dir} | Sensors: [L:{'LIVE' if l_live else 'HOLD'} R:{'LIVE' if r_live else 'HOLD'}]")
             
-            # Deep-dive math is ONLY printed when an anomaly occurs
-            if has_anomaly:
-                print(f"         ↳ Details: {', '.join(anomalies)} | L_Hold: {_left_hold_count}/{MAX_HOLD_FRAMES} | R_Hold: {_right_hold_count}/{MAX_HOLD_FRAMES}")
-                if left_fit is not None and right_fit is not None:
-                    print(f"         ↳ Math: L_fit=[{left_fit[0]:.6f}, {left_fit[1]:.4f}, {left_fit[2]:.1f}] R_fit=[{right_fit[0]:.6f}, {right_fit[1]:.4f}, {right_fit[2]:.1f}]")
-
         _last_warn_state = is_warn
 
     left_pts  = _make_pts(left_fit,  h, left_draw_top,  w)
     right_pts = _make_pts(right_fit, h, right_draw_top, w)
-    left_flat  = left_pts.reshape(-1, 2)
-    right_flat = right_pts.reshape(-1, 2)
-
+    
     overlay = np.zeros_like(frame)
 
     if DEBUG_MASK:
@@ -493,7 +448,7 @@ def process_lanes(frame):
     cv2.polylines(overlay, [left_pts],  isClosed=False, color=border_color, thickness=LINE_THICKNESS)
     cv2.polylines(overlay, [right_pts], isClosed=False, color=border_color, thickness=LINE_THICKNESS)
 
-    direction, pct = _classify_curvature(left_fit, right_fit)
+    direction, pct = _classify_curvature(left_fit, right_fit, h, fill_top_y)
     _draw_curve_arrow(overlay, direction, pct, w, h)
     road_text = {
         'straight': "Stay Straight",

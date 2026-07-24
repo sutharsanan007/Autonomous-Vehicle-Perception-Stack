@@ -1,5 +1,5 @@
 # ─────────────────────────────────────────────────────────────────────────────
-#  main.py  |  Modular Hybrid ADAS — Orchestrator (v6.5 - Clean Final)
+#  main.py  |  Modular Hybrid ADAS — Orchestrator (v6.6 - Sensor Fusion)
 # ─────────────────────────────────────────────────────────────────────────────
 
 import sys
@@ -53,7 +53,6 @@ def draw_hud(image, stats: dict, fps: float, fcw_warning: bool, traffic_alert: s
     font = cv2.FONT_HERSHEY_SIMPLEX
     cv2.putText(image, "<HYBRID ADAS SYSTEM>", (20, 40), font, 0.7, (255, 255, 255), 2)
     
-    # Status Glow Dot for Mode
     is_live = "Live" in road_status
     mode_dot_color = (60, 220, 60) if is_live else (0, 150, 255)
     
@@ -63,7 +62,6 @@ def draw_hud(image, stats: dict, fps: float, fcw_warning: bool, traffic_alert: s
         
     cv2.putText(image, f"Mode: {road_status}", (52, 83), font, 0.6, (230, 230, 230), 2)
 
-    # Geometric Deviation Crosshair Slider
     dev_dir = "L" if deviation > 0 else "R"
     cv2.putText(image, f"Dev: {abs(deviation):.1f}% {dev_dir}", (20, 130), font, 0.6, dev_color, 2)
     
@@ -73,7 +71,6 @@ def draw_hud(image, stats: dict, fps: float, fcw_warning: bool, traffic_alert: s
     cv2.rectangle(image, (track_x, track_y), (track_x + track_w, track_y + track_h), (70, 75, 80), -1)
     cv2.line(image, (track_x + track_w//2, track_y - 4), (track_x + track_w//2, track_y + track_h + 4), (255, 255, 255), 2)
     
-    # Fixed Visual Mapping
     max_track_scale = WARNING_THRESH * 2.0  
     scale_ratio = np.clip(-deviation / max_track_scale, -1.0, 1.0)
     
@@ -138,6 +135,7 @@ def draw_hud(image, stats: dict, fps: float, fcw_warning: bool, traffic_alert: s
 
     return image
 
+
 def main():
     model = initialize_model()
     arg        = sys.argv[1] if len(sys.argv) > 1 else "data/test_video_2.mp4"
@@ -160,8 +158,14 @@ def main():
         fps          = 1.0 / (current_time - prev_time) if prev_time > 0 else 0.0
         prev_time    = current_time
 
-        lane_overlay, lane_stats = process_lanes(frame)
-        frame_with_objects, fcw_warning, traffic_alert = detect_obstacles(frame, model)
+        # ── PIPELINE REORDERED FOR SENSOR FUSION ──
+        # 1. Get object bounding boxes FIRST
+        frame_with_objects, fcw_warning, traffic_alert, vehicle_boxes = detect_obstacles(frame, model)
+        
+        # 2. Pass boxes into the lane process to blindfold the tracking algorithm
+        lane_overlay, lane_stats = process_lanes(frame, vehicle_boxes)
+        
+        # 3. Render outputs
         blended_frame = cv2.addWeighted(frame_with_objects, 1.0, lane_overlay, 0.55, 0)
         final_output = draw_hud(blended_frame, lane_stats, fps, fcw_warning, traffic_alert)
 

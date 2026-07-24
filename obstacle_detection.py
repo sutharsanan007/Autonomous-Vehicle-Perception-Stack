@@ -29,8 +29,6 @@ MIN_SAFE_DIST = 5.0
 
 # ── Persistent State Tracker ──────────────────────────────────────────────────
 _ego_state = {"dist": None, "time": None, "v_rel": 0.0}
-
-# Dictionary to track distance history of individual YOLO object IDs
 _track_history = {}
 
 
@@ -41,9 +39,8 @@ def initialize_model(model_path: str = 'yolov8n.pt') -> YOLO:
 
 def detect_obstacles(frame, model: YOLO):
     """
-    Returns: (annotated_frame, fcw_warning_flag, traffic_alert_string)
+    Returns: (annotated_frame, fcw_warning_flag, traffic_alert_string, vehicle_boxes)
     """
-    # UPGRADED: Using model.track() to assign persistent IDs to vehicles
     results = model.track(
         frame,
         persist=True,
@@ -61,12 +58,13 @@ def detect_obstacles(frame, model: YOLO):
     traffic_alert = None
     current_time  = time.time()
     
-    # We will NOT use r.plot() anymore to keep the screen free of YOLO clutter
     annotated_frame = frame.copy()
     closest_ego_dist = None
+    
+    # ── SENSOR FUSION DATA LIST ──
+    vehicle_boxes = []
 
     for r in results:
-        # Check if tracking IDs are available in this frame
         if r.boxes.id is None:
             continue
             
@@ -75,7 +73,6 @@ def detect_obstacles(frame, model: YOLO):
         for box, track_id in zip(r.boxes, track_ids):
             cls_id = int(box.cls[0])
             
-            # ── FEATURE #1: Traffic Control Detection ──
             if cls_id == 9:
                 traffic_alert = "🚥 TRAFFIC LIGHT AHEAD"
                 continue
@@ -83,22 +80,22 @@ def detect_obstacles(frame, model: YOLO):
                 traffic_alert = "🛑 STOP SIGN AHEAD"
                 continue
             
-            # ── FEATURE #4: Vehicle Tracking & Filtering ──
             if cls_id in [2, 5, 7]:
                 x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
                 pixel_width = x2 - x1
+                
+                # Append coordinates to our fusion list for the lane mask to use
+                vehicle_boxes.append((x1, y1, x2, y2))
                 
                 if pixel_width > 0:
                     dist = (KNOWN_WIDTH * FOCAL_LENGTH) / pixel_width
                     cx = (x1 + x2) / 2.0
                     
-                    # Track absolute closest vehicle in our specific lane for FCW
                     in_path = ego_left_bound < cx < ego_right_bound
                     if in_path:
                         if closest_ego_dist is None or dist < closest_ego_dist:
                             closest_ego_dist = dist
 
-                    # ── STATIONARY CAR FILTER ──
                     if track_id not in _track_history:
                         _track_history[track_id] = {'times': [], 'dists': []}
                         
@@ -112,46 +109,36 @@ def detect_obstacles(frame, model: YOLO):
                         
                     is_stationary_parked = False
                     
-                    # If we have enough tracking data, check the closing speed
                     if len(hist['times']) > 5:
                         dt = hist['times'][-1] - hist['times'][0]
                         if dt > 0:
                             dist_change = hist['dists'][0] - hist['dists'][-1]
-                            closing_speed = dist_change / dt  # meters per second
+                            closing_speed = dist_change / dt 
                             
-                            # If closing speed is high (>6m/s) AND it is outside our lane, 
-                            # it is almost certainly a parked car on the shoulder. Hide it!
                             if closing_speed > 6.0 and not in_path:
                                 is_stationary_parked = True
                     
-                    # ── DRAW SLEEK HUD BOXES (Only for moving or ego-lane cars) ──
                     if not is_stationary_parked:
                         color = (0, 0, 255) if in_path and dist < 10.0 else (255, 255, 0)
                         
-                        # Draw high-tech corner markers instead of bulky boxes
-                        L = 20  # Length of corner lines
-                        t = 2   # Thickness
+                        L = 20  
+                        t = 2   
                         
-                        # Top Left
                         cv2.line(annotated_frame, (int(x1), int(y1)), (int(x1)+L, int(y1)), color, t)
                         cv2.line(annotated_frame, (int(x1), int(y1)), (int(x1), int(y1)+L), color, t)
-                        # Top Right
                         cv2.line(annotated_frame, (int(x2), int(y1)), (int(x2)-L, int(y1)), color, t)
                         cv2.line(annotated_frame, (int(x2), int(y1)), (int(x2), int(y1)+L), color, t)
-                        # Bottom Left
                         cv2.line(annotated_frame, (int(x1), int(y2)), (int(x1)+L, int(y2)), color, t)
                         cv2.line(annotated_frame, (int(x1), int(y2)), (int(x1), int(y2)-L), color, t)
-                        # Bottom Right
                         cv2.line(annotated_frame, (int(x2), int(y2)), (int(x2)-L, int(y2)), color, t)
                         cv2.line(annotated_frame, (int(x2), int(y2)), (int(x2), int(y2)-L), color, t)
                         
-                        # Clean distance label
                         text_y = max(20, int(y1) - 10)
                         cv2.putText(annotated_frame, f"Dist: {dist:.1f}m", 
                                     (int(x1), text_y), 
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-    # ── ADVANCED TTC MATH (Dynamic Collision Warning) ──
+    # Advanced TTC Math
     if closest_ego_dist is not None:
         if _ego_state["dist"] is not None:
             dt = current_time - _ego_state["time"]
@@ -173,4 +160,4 @@ def detect_obstacles(frame, model: YOLO):
         _ego_state["dist"] = None
         _ego_state["v_rel"] = 0.0
 
-    return annotated_frame, fcw_warning, traffic_alert
+    return annotated_frame, fcw_warning, traffic_alert, vehicle_boxes

@@ -39,7 +39,7 @@ def initialize_model(model_path: str = 'yolov8n.pt') -> YOLO:
 
 def detect_obstacles(frame, model: YOLO):
     """
-    Returns: (annotated_frame, fcw_warning_flag, traffic_alert_string, vehicle_boxes)
+    Returns: (annotated_frame, fcw_warning_flag, traffic_alert_string, vehicle_boxes, radar_targets)
     """
     results = model.track(
         frame,
@@ -61,8 +61,9 @@ def detect_obstacles(frame, model: YOLO):
     annotated_frame = frame.copy()
     closest_ego_dist = None
     
-    # ── SENSOR FUSION DATA LIST ──
+    # ── SENSOR FUSION & RADAR DATA ──
     vehicle_boxes = []
+    radar_targets = []  # Stores (distance, center_x, color) for the HUD map
 
     for r in results:
         if r.boxes.id is None:
@@ -84,7 +85,6 @@ def detect_obstacles(frame, model: YOLO):
                 x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
                 pixel_width = x2 - x1
                 
-                # Append coordinates to our fusion list for the lane mask to use
                 vehicle_boxes.append((x1, y1, x2, y2))
                 
                 if pixel_width > 0:
@@ -119,7 +119,18 @@ def detect_obstacles(frame, model: YOLO):
                                 is_stationary_parked = True
                     
                     if not is_stationary_parked:
-                        color = (0, 0, 255) if in_path and dist < 10.0 else (255, 255, 0)
+                        # ── Dynamic RGB Target Grading ──
+                        if in_path:
+                            d_clamp = max(5.0, min(dist, 25.0))
+                            ratio = (d_clamp - 5.0) / 20.0
+                            r = 255 if ratio < 0.5 else int(255 * (1.0 - ratio) * 2)
+                            g = 255 if ratio > 0.5 else int(255 * ratio * 2)
+                            color = (0, g, r) 
+                        else:
+                            color = (255, 200, 0) # Cyan for adjacent lanes
+                        
+                        # Add object to Radar Map
+                        radar_targets.append((dist, cx, color))
                         
                         L = 20  
                         t = 2   
@@ -160,4 +171,4 @@ def detect_obstacles(frame, model: YOLO):
         _ego_state["dist"] = None
         _ego_state["v_rel"] = 0.0
 
-    return annotated_frame, fcw_warning, traffic_alert, vehicle_boxes
+    return annotated_frame, fcw_warning, traffic_alert, vehicle_boxes, radar_targets

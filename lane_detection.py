@@ -1,5 +1,5 @@
 # ─────────────────────────────────────────────────────────────────────────────
-#  lane_detection.py  |  Modular Hybrid ADAS — Lane Perception Module  (v6.9)
+#  lane_detection.py  |  Modular Hybrid ADAS — Lane Perception Module  (v6.10)
 # ─────────────────────────────────────────────────────────────────────────────
 
 import warnings
@@ -64,11 +64,13 @@ DEBUG_MASK = False
 DEBUG_PRINT = True
 _frame_counter = 0
 
+# ── PERSISTENT STATES ──
 _prev_left_fit    = None         
 _prev_right_fit   = None
 _left_hold_count  = 0           
 _right_hold_count = 0
 _last_warn_state  = False           
+_smoothed_bulge   = 0.0      # NEW: Temporal memory for the curve
 
 
 def _infer_mask(frame, h, w, vehicle_boxes=None):
@@ -245,14 +247,17 @@ def _lanes_crossing(left_fit, right_fit, h, w, horizon_y):
     return bool(actual_crossing or too_narrow)
 
 
-# ── PERFECTED: Inverse Visibility Curve Scaling ──
+# ── FINAL POLISH: Temporal Smoothing & Dynamic Sensitivity ──
 def _classify_curvature(left_fit, right_fit, h, top_y):
+    global _smoothed_bulge
+    
     y_bot = float(h - 1)
     y_top = float(max(top_y, 0))
     carpet_height = y_bot - y_top
     
-    # 1. HARD CUTOFF: If view is utterly blocked, do not guess.
-    if carpet_height < (h * 0.20):
+    # 1. HARD CUTOFF: If view is heavily blocked, smoothly decay memory to 0 (Straight).
+    if carpet_height < (h * 0.25):
+        _smoothed_bulge = _smoothed_bulge * 0.5
         return 'straight', 0
         
     y_mid = (y_bot + y_top) / 2.0
@@ -262,25 +267,28 @@ def _classify_curvature(left_fit, right_fit, h, top_y):
     cx_mid = (_eval(left_fit, y_mid) + _eval(right_fit, y_mid)) / 2.0
     
     straight_mid_x = (cx_bot + cx_top) / 2.0
-    bulge = cx_mid - straight_mid_x
+    raw_bulge = cx_mid - straight_mid_x
     
-    # 2. VISIBILITY SCALING
-    # visibility_ratio ranges from ~0.2 (terrible view) to ~0.7 (perfect view)
+    # 2. TEMPORAL SMOOTHING: Absorbs frame-by-frame noise completely.
+    _smoothed_bulge = (_smoothed_bulge * 0.85) + (raw_bulge * 0.15)
+    
+    # 3. VISIBILITY SCALING
     visibility_ratio = carpet_height / h 
     
-    # When visibility is excellent, dead zone shrinks to 3.0 pixels (highly sensitive)
-    # When visibility is terrible, dead zone swells to 12.0+ pixels (ignores fake wiggles)
-    dynamic_dead_zone = 3.0 + (1.0 - visibility_ratio) * 12.0 
+    # Dead zone shrinks to just 2.0 pixels for perfect clear views (catches slight curves)
+    dynamic_dead_zone = 2.0 + (1.0 - visibility_ratio) * 6.0 
     
-    if abs(bulge) < dynamic_dead_zone:
+    if abs(_smoothed_bulge) < dynamic_dead_zone:
+        # If road is straight, gently pull memory back to 0 to prevent it floating near the edge
+        _smoothed_bulge = _smoothed_bulge * 0.8
         return 'straight', 0
 
-    # 3. DYNAMIC PERCENTAGE MAPPING
-    # A 15px bulge on a short line is a sharper curve than a 15px bulge on a long line.
-    expected_max_bulge = 45.0 * visibility_ratio 
-    pct = int(round(np.clip((abs(bulge) / expected_max_bulge) * 100.0, 0, 100)))
+    # 4. SENSITIVITY CALIBRATION: The "Floor" prevents 100% jumps on short lines.
+    expected_max_bulge = max(20.0, 55.0 * visibility_ratio) 
+    
+    pct = int(round(np.clip((abs(_smoothed_bulge) / expected_max_bulge) * 100.0, 0, 100)))
         
-    return ('left', pct) if bulge > 0 else ('right', pct)
+    return ('left', pct) if _smoothed_bulge > 0 else ('right', pct)
 
 
 def _arrow_polygon(cx, cy, direction, size):

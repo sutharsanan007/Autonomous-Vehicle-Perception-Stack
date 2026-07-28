@@ -1,5 +1,5 @@
 # ─────────────────────────────────────────────────────────────────────────────
-#  main.py  |  Modular Hybrid ADAS — Orchestrator (v6.6 - Sensor Fusion)
+#  main.py  |  Modular Hybrid ADAS — Orchestrator (v6.7 - UI Mastery + Radar)
 # ─────────────────────────────────────────────────────────────────────────────
 
 import sys
@@ -12,7 +12,7 @@ from lane_detection import process_lanes, WARNING_THRESH
 def resolve_source(arg: str):
     return int(arg) if arg.isdigit() else arg
 
-def draw_hud(image, stats: dict, fps: float, fcw_warning: bool, traffic_alert: str):
+def draw_hud(image, stats: dict, fps: float, fcw_warning: bool, traffic_alert: str, radar_targets: list):
     h, w = image.shape[:2]
 
     # ── Emergency Collision Override ──
@@ -77,7 +77,68 @@ def draw_hud(image, stats: dict, fps: float, fcw_warning: bool, traffic_alert: s
     slider_cx = int((track_x + track_w//2) + (scale_ratio * (track_w // 2)))
     cv2.rectangle(image, (slider_cx - 4, track_y - 3), (slider_cx + 4, track_y + track_h + 3), dev_color, -1)
 
-    # ── Top-right status panel ──
+    # ── Steering Wheel Correction Arc (Bottom Center) ──
+    arc_cx, arc_cy = w // 2, h - 140
+    arc_radius = 50
+    cv2.ellipse(image, (arc_cx, arc_cy), (arc_radius, arc_radius), 0, 180, 360, (70, 75, 80), 2)
+    cv2.ellipse(image, (arc_cx, arc_cy), (arc_radius, arc_radius), 0, 268, 272, (255, 255, 255), 2) 
+    
+    steer_angle = np.clip(deviation * 4.0, -70, 70)
+    active_angle = 270 + steer_angle
+    
+    cv2.ellipse(image, (arc_cx, arc_cy), (arc_radius, arc_radius), 0, active_angle - 25, active_angle + 25, dev_color, 6)
+    
+    tick_in_x  = int(arc_cx + (arc_radius - 10) * np.cos(np.radians(active_angle)))
+    tick_in_y  = int(arc_cy + (arc_radius - 10) * np.sin(np.radians(active_angle)))
+    tick_out_x = int(arc_cx + (arc_radius + 10) * np.cos(np.radians(active_angle)))
+    tick_out_y = int(arc_cy + (arc_radius + 10) * np.sin(np.radians(active_angle)))
+    cv2.line(image, (tick_in_x, tick_in_y), (tick_out_x, tick_out_y), (255, 255, 255), 2)
+
+
+    # ── Mini Top-Down Radar Box (Bottom Right) ──
+    radar_w, radar_h = 160, 220
+    radar_x0 = w - radar_w - 20
+    radar_y0 = h - radar_h - 20
+    
+    overlay_radar = image.copy()
+    cv2.rectangle(overlay_radar, (radar_x0, radar_y0), (radar_x0 + radar_w, radar_y0 + radar_h), (20, 25, 30), -1)
+    cv2.addWeighted(overlay_radar, 0.85, image, 0.15, 0, image)
+    cv2.rectangle(image, (radar_x0, radar_y0), (radar_x0 + radar_w, radar_y0 + radar_h), (80, 80, 90), 1)
+    
+    max_radar_dist = 40.0
+    ego_cx = radar_x0 + radar_w // 2
+    ego_cy = radar_y0 + radar_h - 25
+    
+    # Draw Grid Lines (10m, 20m, 30m)
+    for d in [10, 20, 30]:
+        grid_y = ego_cy - int((d / max_radar_dist) * (radar_h - 40))
+        cv2.line(image, (radar_x0, grid_y), (radar_x0 + radar_w, grid_y), (60, 65, 70), 1)
+        cv2.putText(image, f"{d}m", (radar_x0 + 3, grid_y - 3), font, 0.35, (150, 150, 150), 1)
+        
+    # Draw Ego Lane projection bounds
+    lane_w = int(radar_w * 0.35)
+    cv2.line(image, (ego_cx - lane_w//2, radar_y0), (ego_cx - lane_w//2, ego_cy), (60, 90, 60), 1)
+    cv2.line(image, (ego_cx + lane_w//2, radar_y0), (ego_cx + lane_w//2, ego_cy), (60, 90, 60), 1)
+    
+    # Plot Dynamic Radar Targets
+    for (dist, obj_cx, color) in radar_targets:
+        if dist > max_radar_dist: dist = max_radar_dist
+        # Map distance to Y axis
+        plot_y = ego_cy - int((dist / max_radar_dist) * (radar_h - 40))
+        # Map camera X bounds to Radar X bounds
+        plot_x = radar_x0 + int((obj_cx / w) * radar_w)
+        
+        cv2.circle(image, (plot_x, plot_y), 5, color, -1)
+        cv2.circle(image, (plot_x, plot_y), 5, (255, 255, 255), 1) # Clean white border
+        
+    # Draw Ego Car (White Triangle)
+    pts = np.array([[ego_cx, ego_cy - 8], [ego_cx - 6, ego_cy + 8], [ego_cx + 6, ego_cy + 8]], np.int32)
+    cv2.fillPoly(image, [pts], (255, 255, 255))
+    
+    cv2.putText(image, "[BIRD'S EYE RADAR]", (radar_x0 + 10, radar_y0 + 20), font, 0.45, (230, 230, 230), 1)
+
+
+    # ── Top-Right Status Panel ──
     panel_w = 480
     panel_h = 135
     panel_x0 = w - panel_w - 20
@@ -158,16 +219,13 @@ def main():
         fps          = 1.0 / (current_time - prev_time) if prev_time > 0 else 0.0
         prev_time    = current_time
 
-        # ── PIPELINE REORDERED FOR SENSOR FUSION ──
-        # 1. Get object bounding boxes FIRST
-        frame_with_objects, fcw_warning, traffic_alert, vehicle_boxes = detect_obstacles(frame, model)
-        
-        # 2. Pass boxes into the lane process to blindfold the tracking algorithm
+        # ── PIPELINE WITH RADAR EXTENSION ──
+        frame_with_objects, fcw_warning, traffic_alert, vehicle_boxes, radar_targets = detect_obstacles(frame, model)
         lane_overlay, lane_stats = process_lanes(frame, vehicle_boxes)
-        
-        # 3. Render outputs
         blended_frame = cv2.addWeighted(frame_with_objects, 1.0, lane_overlay, 0.55, 0)
-        final_output = draw_hud(blended_frame, lane_stats, fps, fcw_warning, traffic_alert)
+        
+        # Pass radar targets into the draw_hud function
+        final_output = draw_hud(blended_frame, lane_stats, fps, fcw_warning, traffic_alert, radar_targets)
 
         cv2.imshow("Modular Hybrid ADAS Prototype", final_output)
         if cv2.waitKey(1) & 0xFF == ord('q'):

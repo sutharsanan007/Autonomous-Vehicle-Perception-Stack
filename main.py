@@ -199,7 +199,7 @@ def draw_hud(image, stats: dict, fps: float, fcw_warning: bool, traffic_alert: s
 
 def main():
     model = initialize_model()
-    arg        = sys.argv[1] if len(sys.argv) > 1 else "data/test_video_2.mp4"
+    arg        = sys.argv[1] if len(sys.argv) > 1 else "data/test_video.mp4"
     source     = resolve_source(arg)
     cap        = cv2.VideoCapture(source)
     prev_time  = 0
